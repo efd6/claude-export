@@ -72,16 +72,26 @@ func sessionFiles(dir string) ([]string, error) {
 
 // rawRecord is a partially decoded JSONL record.
 type rawRecord struct {
-	Type        string      `json:"type"`
-	UUID        string      `json:"uuid"`
-	ParentUUID  *string     `json:"parentUuid"`
-	IsSidechain bool        `json:"isSidechain"`
-	Timestamp   string      `json:"timestamp"`
-	CWD         string      `json:"cwd"`
-	AITitle     string      `json:"aiTitle"`
-	LeafUUID    string      `json:"leafUuid"`
-	LastPrompt  string      `json:"lastPrompt"`
-	Message     *rawMessage `json:"message"`
+	Type            string        `json:"type"`
+	Subtype         string        `json:"subtype"`
+	UUID            string        `json:"uuid"`
+	ParentUUID      *string       `json:"parentUuid"`
+	IsSidechain     bool          `json:"isSidechain"`
+	Timestamp       string        `json:"timestamp"`
+	CWD             string        `json:"cwd"`
+	AITitle         string        `json:"aiTitle"`
+	LeafUUID        string        `json:"leafUuid"`
+	LastPrompt      string        `json:"lastPrompt"`
+	Message         *rawMessage   `json:"message"`
+	CompactMetadata *compactMeta  `json:"compactMetadata"`
+}
+
+// compactMeta holds the subset of compactMetadata we need to cross
+// compaction boundaries during chain traversal.
+type compactMeta struct {
+	PreservedSegment struct {
+		TailUUID string `json:"tailUuid"`
+	} `json:"preservedSegment"`
 }
 
 // rawMessage is the partially decoded message field within a rawRecord.
@@ -165,7 +175,9 @@ func parseSession(path, id string, extra bool) (session, string, error) {
 	}
 
 	// Walk the parentUuid chain from leaf to root, then reverse to get
-	// chronological order.
+	// chronological order. compact_boundary records are not added to the
+	// chain; instead, traversal continues via preservedSegment.tailUuid so
+	// pre-compaction messages are included transparently.
 	var chain []*rawRecord
 	seen := make(map[string]struct{})
 	for cur := leafUUID; cur != ""; {
@@ -177,6 +189,13 @@ func parseSession(path, id string, extra bool) (session, string, error) {
 			break
 		}
 		seen[cur] = struct{}{}
+		if r.Type == "system" && r.Subtype == "compact_boundary" {
+			if r.CompactMetadata != nil && r.CompactMetadata.PreservedSegment.TailUUID != "" {
+				cur = r.CompactMetadata.PreservedSegment.TailUUID
+				continue
+			}
+			break
+		}
 		chain = append(chain, r)
 		if r.ParentUUID == nil {
 			break
