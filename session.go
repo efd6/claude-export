@@ -70,6 +70,99 @@ func sessionFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
+// sessionGroup holds the files belonging to one logical session,
+// ordered from earliest to latest.
+type sessionGroup struct {
+	id    string
+	files []string
+}
+
+// groupSessionFiles groups JSONL files by logical session, linking
+// continuation files to their predecessors.
+func groupSessionFiles(files []string) ([]sessionGroup, error) {
+	pathByID := make(map[string]string, len(files))
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
+		pathByID[id] = f
+	}
+
+	pred := make(map[string]string)
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
+		p, err := findPredecessor(f)
+		if err != nil || p == "" {
+			continue
+		}
+		pred[id] = p
+	}
+
+	succ := make(map[string]string, len(pred))
+	for child, parent := range pred {
+		succ[parent] = child
+	}
+
+	grouped := make(map[string]bool, len(files))
+	var groups []sessionGroup
+	for _, f := range files {
+		id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
+		if grouped[id] {
+			continue
+		}
+		root := id
+		for {
+			p, ok := pred[root]
+			if !ok {
+				break
+			}
+			root = p
+		}
+		var chain []string
+		cur := root
+		for {
+			if path, ok := pathByID[cur]; ok {
+				chain = append(chain, path)
+			}
+			grouped[cur] = true
+			next, ok := succ[cur]
+			if !ok {
+				break
+			}
+			cur = next
+		}
+		if len(chain) > 0 {
+			groups = append(groups, sessionGroup{
+				id:    strings.TrimSuffix(filepath.Base(chain[0]), ".jsonl"),
+				files: chain,
+			})
+		}
+	}
+
+	return groups, nil
+}
+
+// findPredecessor scans a session file for records with a session_id
+// field that differs from the file's own session ID, indicating this
+// file is a continuation of an earlier session.
+func findPredecessor(path string) (string, error) {
+	fileID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 16<<20), 16<<20)
+	for sc.Scan() {
+		var r struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal(sc.Bytes(), &r) == nil && r.SessionID != "" && r.SessionID != fileID {
+			return r.SessionID, nil
+		}
+	}
+	return "", sc.Err()
+}
+
 // rawRecord is a partially decoded JSONL record.
 type rawRecord struct {
 	Type            string        `json:"type"`
@@ -113,52 +206,69 @@ type contentBlock struct {
 	Content   json.RawMessage `json:"content"` // string or block array for tool_result
 }
 
-// parseSession reads a JSONL session file and returns the reconstructed
-// session and the working directory recorded in the session records.
-func parseSession(path, id string, extra bool) (session, string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return session{}, "", fmt.Errorf("open: %w", err)
-	}
-	defer f.Close()
-
-	var records []rawRecord
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 16<<20), 16<<20)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+// parseSession reads one or more JSONL session files belonging to
+// the same logical session and returns the reconstructed session and
+// the working directory. When multiple files are provided they must
+// be ordered from oldest to newest.
+func parseSession(paths []string, id string, extra bool) (session, string, error) {
+	var perFile [][]rawRecord
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return session{}, "", fmt.Errorf("open %s: %w", path, err)
 		}
-		var r rawRecord
-		if json.Unmarshal(line, &r) == nil {
-			records = append(records, r)
+		var records []rawRecord
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 16<<20), 16<<20)
+		for sc.Scan() {
+			line := sc.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var r rawRecord
+			if json.Unmarshal(line, &r) == nil {
+				records = append(records, r)
+			}
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return session{}, "", fmt.Errorf("reading: %w", err)
-	}
-	if len(records) == 0 {
-		return session{}, "", fmt.Errorf("empty file")
+		f.Close()
+		if err := sc.Err(); err != nil {
+			return session{}, "", fmt.Errorf("reading %s: %w", path, err)
+		}
+		perFile = append(perFile, records)
 	}
 
-	// Use the last ai-title record as the session title.
+	empty := true
+	for _, records := range perFile {
+		if len(records) > 0 {
+			empty = false
+			break
+		}
+	}
+	if empty {
+		return session{}, "", fmt.Errorf("empty session")
+	}
+
+	// Use the last ai-title record across all files as the session title.
 	var title string
-	for _, r := range records {
-		if r.Type == "ai-title" && r.AITitle != "" {
-			title = r.AITitle
+	for _, records := range perFile {
+		for _, r := range records {
+			if r.Type == "ai-title" && r.AITitle != "" {
+				title = r.AITitle
+			}
 		}
 	}
 
 	// Find the leaf UUID from the last last-prompt record that has a
 	// lastPrompt value; fall back to the first last-prompt otherwise.
 	var leafUUID string
-	for _, r := range records {
-		if r.Type == "last-prompt" {
-			if r.LastPrompt != "" {
-				leafUUID = r.LeafUUID
-			} else if leafUUID == "" {
-				leafUUID = r.LeafUUID
+	for _, records := range perFile {
+		for _, r := range records {
+			if r.Type == "last-prompt" {
+				if r.LastPrompt != "" {
+					leafUUID = r.LeafUUID
+				} else if leafUUID == "" {
+					leafUUID = r.LeafUUID
+				}
 			}
 		}
 	}
@@ -166,11 +276,24 @@ func parseSession(path, id string, extra bool) (session, string, error) {
 		return session{}, "", fmt.Errorf("no leaf UUID")
 	}
 
-	// Build a UUID → record index.
-	byUUID := make(map[string]*rawRecord, len(records))
-	for i := range records {
-		if records[i].UUID != "" {
-			byUUID[records[i].UUID] = &records[i]
+	// Build UUID → record index. Within each file the last record
+	// with a given UUID wins (in-file updates). Across files the
+	// oldest version takes priority so that the parentUuid chain of
+	// preserved records leads into the earlier file's history rather
+	// than back to the compact_boundary.
+	byUUID := make(map[string]*rawRecord)
+	for fi := range perFile {
+		fileIdx := make(map[string]*rawRecord, len(perFile[fi]))
+		for i := range perFile[fi] {
+			r := &perFile[fi][i]
+			if r.UUID != "" {
+				fileIdx[r.UUID] = r
+			}
+		}
+		for uuid, r := range fileIdx {
+			if _, exists := byUUID[uuid]; !exists {
+				byUUID[uuid] = r
+			}
 		}
 	}
 

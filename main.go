@@ -161,11 +161,15 @@ func listSessions(dirs []string, projectFilter, sessionFilter string) error {
 			log.Printf("warning: %v", err)
 			continue
 		}
+		groups, err := groupSessionFiles(files)
+		if err != nil {
+			log.Printf("warning: grouping sessions: %v", err)
+			continue
+		}
 		var lines []string
 		var projectPath string
-		for _, f := range files {
-			id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-			s, cwd, err := parseSession(f, id, false)
+		for _, g := range groups {
+			s, cwd, err := parseSession(g.files, g.id, false)
 			if err != nil {
 				continue
 			}
@@ -221,10 +225,13 @@ func listSessionsJSON(dirs []string, projectFilter, sessionFilter string) error 
 		if err != nil {
 			continue
 		}
+		groups, err := groupSessionFiles(files)
+		if err != nil {
+			continue
+		}
 		var projectPath string
-		for _, f := range files {
-			id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-			s, cwd, err := parseSession(f, id, false)
+		for _, g := range groups {
+			s, cwd, err := parseSession(g.files, g.id, false)
 			if err != nil {
 				continue
 			}
@@ -258,12 +265,16 @@ func exportProject(dir, sessionFilter string, extra bool) (projectExport, error)
 		return projectExport{}, err
 	}
 
+	groups, err := groupSessionFiles(files)
+	if err != nil {
+		return projectExport{}, fmt.Errorf("grouping sessions: %w", err)
+	}
+
 	export := projectExport{DirName: filepath.Base(dir)}
-	for _, f := range files {
-		id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-		s, cwd, err := parseSession(f, id, extra)
+	for _, g := range groups {
+		s, cwd, err := parseSession(g.files, g.id, extra)
 		if err != nil {
-			log.Printf("warning: session %s: %v", id, err)
+			log.Printf("warning: session %s: %v", g.id, err)
 			continue
 		}
 		if export.Path == "" && cwd != "" {
