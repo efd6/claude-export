@@ -131,7 +131,7 @@ func groupSessionFiles(files []string) ([]sessionGroup, error) {
 		}
 		if len(chain) > 0 {
 			groups = append(groups, sessionGroup{
-				id:    strings.TrimSuffix(filepath.Base(chain[0]), ".jsonl"),
+				id:    strings.TrimSuffix(filepath.Base(chain[len(chain)-1]), ".jsonl"),
 				files: chain,
 			})
 		}
@@ -165,18 +165,18 @@ func findPredecessor(path string) (string, error) {
 
 // rawRecord is a partially decoded JSONL record.
 type rawRecord struct {
-	Type            string        `json:"type"`
-	Subtype         string        `json:"subtype"`
-	UUID            string        `json:"uuid"`
-	ParentUUID      *string       `json:"parentUuid"`
-	IsSidechain     bool          `json:"isSidechain"`
-	Timestamp       string        `json:"timestamp"`
-	CWD             string        `json:"cwd"`
-	AITitle         string        `json:"aiTitle"`
-	LeafUUID        string        `json:"leafUuid"`
-	LastPrompt      string        `json:"lastPrompt"`
-	Message         *rawMessage   `json:"message"`
-	CompactMetadata *compactMeta  `json:"compactMetadata"`
+	Type            string       `json:"type"`
+	Subtype         string       `json:"subtype"`
+	UUID            string       `json:"uuid"`
+	ParentUUID      *string      `json:"parentUuid"`
+	IsSidechain     bool         `json:"isSidechain"`
+	Timestamp       string       `json:"timestamp"`
+	CWD             string       `json:"cwd"`
+	AITitle         string       `json:"aiTitle"`
+	LeafUUID        string       `json:"leafUuid"`
+	LastPrompt      string       `json:"lastPrompt"`
+	Message         *rawMessage  `json:"message"`
+	CompactMetadata *compactMeta `json:"compactMetadata"`
 }
 
 // compactMeta holds the subset of compactMetadata we need to cross
@@ -281,13 +281,27 @@ func parseSession(paths []string, id string, extra bool) (session, string, error
 	// oldest version takes priority so that the parentUuid chain of
 	// preserved records leads into the earlier file's history rather
 	// than back to the compact_boundary.
+	//
+	// Also build a map from each compact_boundary UUID to the leaf
+	// UUID of the preceding segment (from the last-prompt record
+	// before the boundary). When the boundary's preserved-segment
+	// tail has already been visited (cycle within one file), this
+	// leaf lets the traversal continue into the previous segment.
 	byUUID := make(map[string]*rawRecord)
+	boundaryLeaf := make(map[string]string)
 	for fi := range perFile {
 		fileIdx := make(map[string]*rawRecord, len(perFile[fi]))
+		var lastLeaf string
 		for i := range perFile[fi] {
 			r := &perFile[fi][i]
 			if r.UUID != "" {
 				fileIdx[r.UUID] = r
+			}
+			if r.Type == "last-prompt" && r.LeafUUID != "" {
+				lastLeaf = r.LeafUUID
+			}
+			if r.Type == "system" && r.Subtype == "compact_boundary" && r.UUID != "" && lastLeaf != "" {
+				boundaryLeaf[r.UUID] = lastLeaf
 			}
 		}
 		for uuid, r := range fileIdx {
@@ -301,6 +315,12 @@ func parseSession(paths []string, id string, extra bool) (session, string, error
 	// chronological order. compact_boundary records are not added to the
 	// chain; instead, traversal continues via preservedSegment.tailUuid so
 	// pre-compaction messages are included transparently.
+	//
+	// When a boundary's tail has already been visited the preserved
+	// records form a cycle back to the boundary. In that case fall
+	// back to the leaf of the segment that preceded the boundary,
+	// which lets the traversal continue through earlier compaction
+	// segments within the same file.
 	var chain []*rawRecord
 	seen := make(map[string]struct{})
 	for cur := leafUUID; cur != ""; {
@@ -314,7 +334,15 @@ func parseSession(paths []string, id string, extra bool) (session, string, error
 		seen[cur] = struct{}{}
 		if r.Type == "system" && r.Subtype == "compact_boundary" {
 			if r.CompactMetadata != nil && r.CompactMetadata.PreservedSegment.TailUUID != "" {
-				cur = r.CompactMetadata.PreservedSegment.TailUUID
+				tail := r.CompactMetadata.PreservedSegment.TailUUID
+				if _, visited := seen[tail]; visited {
+					if prev, ok := boundaryLeaf[r.UUID]; ok {
+						cur = prev
+						continue
+					}
+					break
+				}
+				cur = tail
 				continue
 			}
 			break
