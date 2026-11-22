@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -127,6 +128,7 @@ type session struct {
 // subagent represents a subagent session spawned from a parent session.
 type subagent struct {
 	ID          string    `json:"id"`
+	ToolUseID   string    `json:"toolUseId,omitempty"`
 	Name        string    `json:"name,omitempty"`
 	Type        string    `json:"type,omitempty"`
 	Description string    `json:"description,omitempty"`
@@ -378,11 +380,38 @@ func writeMarkdown(w io.Writer, exports []projectExport) {
 			fmt.Fprintf(w, "## %s\n\n", title)
 			fmt.Fprintf(w, "- ID: %s\n", s.ID)
 			fmt.Fprintf(w, "- Created: %s\n\n", s.CreatedAt.Format(time.RFC3339))
+			subByID := make(map[string]subagent, len(s.Subagents))
+			subByToolUseID := make(map[string]subagent, len(s.Subagents))
+			for _, sub := range s.Subagents {
+				subByID[sub.ID] = sub
+				if sub.ToolUseID != "" {
+					subByToolUseID[sub.ToolUseID] = sub
+				}
+			}
+			rendered := make(map[string]bool)
 			for _, msg := range s.Messages {
+				// Render subagent before the tool_result that
+				// reports its completion.
+				if msg.ToolResult != nil {
+					if sub, ok := subByToolUseID[msg.ToolResult.ToolUseID]; ok && !rendered[sub.ID] {
+						rendered[sub.ID] = true
+						writeMarkdownSubagent(w, sub)
+					}
+				}
 				writeMarkdownMessage(w, msg)
+				// Fall back to task-notification matching when
+				// tool_results are not visible (-extra is off).
+				for _, id := range taskIDs(msg) {
+					if sub, ok := subByID[id]; ok && !rendered[id] {
+						rendered[id] = true
+						writeMarkdownSubagent(w, sub)
+					}
+				}
 			}
 			for _, sub := range s.Subagents {
-				writeMarkdownSubagent(w, sub)
+				if !rendered[sub.ID] {
+					writeMarkdownSubagent(w, sub)
+				}
 			}
 			fmt.Fprintln(w, "---")
 		}
@@ -433,6 +462,26 @@ func writeMarkdownMessage(w io.Writer, msg message) {
 	if msg.Text != "" {
 		fmt.Fprintf(w, "%s\n\n", msg.Text)
 	}
+}
+
+var taskIDPattern = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
+
+// taskIDs extracts subagent IDs from task-notification markers in a message.
+func taskIDs(msg message) []string {
+	var ids []string
+	for _, src := range [...]string{msg.Text, toolResultText(msg)} {
+		for _, m := range taskIDPattern.FindAllStringSubmatch(src, -1) {
+			ids = append(ids, m[1])
+		}
+	}
+	return ids
+}
+
+func toolResultText(msg message) string {
+	if msg.ToolResult != nil {
+		return msg.ToolResult.Content
+	}
+	return ""
 }
 
 func writeMarkdownSubagent(w io.Writer, sub subagent) {

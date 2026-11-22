@@ -403,6 +403,7 @@ type subagentMeta struct {
 	AgentType   string `json:"agentType"`
 	Description string `json:"description"`
 	Name        string `json:"name"`
+	ToolUseID   string `json:"toolUseId"`
 }
 
 // parseSubagents reads all subagent JSONL files for a session and returns
@@ -506,9 +507,11 @@ func parseSubagents(projectDir, sessionID string, extra bool) ([]subagent, error
 		if len(msgs) == 0 {
 			continue
 		}
+		msgs = deduplicateAgentCall(msgs)
 
 		subs = append(subs, subagent{
 			ID:          agentID,
+			ToolUseID:   meta.ToolUseID,
 			Name:        meta.Name,
 			Type:        meta.AgentType,
 			Description: meta.Description,
@@ -522,6 +525,25 @@ func parseSubagents(projectDir, sessionID string, extra bool) ([]subagent, error
 	})
 
 	return subs, nil
+}
+
+// deduplicateAgentCall replaces the leading Agent tool_use in a
+// subagent's messages with a short note. The fork's JSONL echoes
+// the parent's Agent call as its first assistant record; showing it
+// again under the subagent heading duplicates what the parent session
+// already contains.
+func deduplicateAgentCall(msgs []message) []message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	if msgs[0].ToolUse != nil && msgs[0].ToolUse.Name == "Agent" {
+		msgs[0] = message{
+			Role:      msgs[0].Role,
+			Timestamp: msgs[0].Timestamp,
+			Text:      "(see Agent call in parent session)",
+		}
+	}
+	return msgs
 }
 
 // buildMessages converts a chain of raw records into conversation messages.
