@@ -25,6 +25,7 @@ func main() {
 	sessionFilter := flag.String("session", "", "export only sessions whose title contains this string (case-insensitive)")
 	list := flag.Bool("list", false, "list all sessions and exit")
 	extra := flag.Bool("extra", false, "include thinking blocks and tool calls")
+	subagents := flag.Bool("subagents", false, "include subagent sessions")
 	format := flag.String("format", "json", "output format: json or md")
 	outFile := flag.String("o", "", "output file (default: stdout)")
 	flag.Parse()
@@ -61,7 +62,7 @@ func main() {
 		if !ok {
 			continue
 		}
-		export, err := exportProject(dir, *sessionFilter, *extra)
+		export, err := exportProject(dir, *sessionFilter, *extra, *subagents)
 		if err != nil {
 			log.Printf("warning: project %s: %v", filepath.Base(dir), err)
 			continue
@@ -116,10 +117,21 @@ type projectExport struct {
 
 // session represents a single Claude CLI conversation.
 type session struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
-	Messages  []message `json:"messages"`
+	ID        string     `json:"id"`
+	Title     string     `json:"title,omitempty"`
+	CreatedAt time.Time  `json:"createdAt"`
+	Messages  []message  `json:"messages"`
+	Subagents []subagent `json:"subagents,omitempty"`
+}
+
+// subagent represents a subagent session spawned from a parent session.
+type subagent struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name,omitempty"`
+	Type        string    `json:"type,omitempty"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	Messages    []message `json:"messages"`
 }
 
 // message is a single turn in a conversation.
@@ -259,7 +271,7 @@ func listSessionsJSON(dirs []string, projectFilter, sessionFilter string) error 
 }
 
 // exportProject loads and filters all sessions from a project directory.
-func exportProject(dir, sessionFilter string, extra bool) (projectExport, error) {
+func exportProject(dir, sessionFilter string, extra, includeSubagents bool) (projectExport, error) {
 	files, err := sessionFiles(dir)
 	if err != nil {
 		return projectExport{}, err
@@ -284,6 +296,13 @@ func exportProject(dir, sessionFilter string, extra bool) (projectExport, error)
 			continue
 		}
 		if len(s.Messages) > 0 {
+			if includeSubagents {
+				subs, err := parseSubagents(dir, g.id, extra)
+				if err != nil {
+					log.Printf("warning: session %s subagents: %v", g.id, err)
+				}
+				s.Subagents = subs
+			}
 			export.Sessions = append(export.Sessions, s)
 		}
 	}
@@ -362,6 +381,9 @@ func writeMarkdown(w io.Writer, exports []projectExport) {
 			for _, msg := range s.Messages {
 				writeMarkdownMessage(w, msg)
 			}
+			for _, sub := range s.Subagents {
+				writeMarkdownSubagent(w, sub)
+			}
 			fmt.Fprintln(w, "---")
 		}
 	}
@@ -410,5 +432,27 @@ func writeMarkdownMessage(w io.Writer, msg message) {
 	}
 	if msg.Text != "" {
 		fmt.Fprintf(w, "%s\n\n", msg.Text)
+	}
+}
+
+func writeMarkdownSubagent(w io.Writer, sub subagent) {
+	title := sub.Name
+	if title == "" {
+		title = sub.ID
+	}
+	fmt.Fprintf(w, "### subagent: %s\n\n", title)
+	if sub.Description != "" {
+		fmt.Fprintf(w, "- Description: %s\n", sub.Description)
+	}
+	if sub.Type != "" {
+		fmt.Fprintf(w, "- Type: %s\n", sub.Type)
+	}
+	fmt.Fprintf(w, "- ID: %s\n", sub.ID)
+	if !sub.CreatedAt.IsZero() {
+		fmt.Fprintf(w, "- Created: %s\n", sub.CreatedAt.Format(time.RFC3339))
+	}
+	fmt.Fprintln(w)
+	for _, msg := range sub.Messages {
+		writeMarkdownMessage(w, msg)
 	}
 }

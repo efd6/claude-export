@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -213,25 +214,8 @@ type contentBlock struct {
 func parseSession(paths []string, id string, extra bool) (session, string, error) {
 	var perFile [][]rawRecord
 	for _, path := range paths {
-		f, err := os.Open(path)
+		records, err := readRecords(path)
 		if err != nil {
-			return session{}, "", fmt.Errorf("open %s: %w", path, err)
-		}
-		var records []rawRecord
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 16<<20), 16<<20)
-		for sc.Scan() {
-			line := sc.Bytes()
-			if len(line) == 0 {
-				continue
-			}
-			var r rawRecord
-			if json.Unmarshal(line, &r) == nil {
-				records = append(records, r)
-			}
-		}
-		f.Close()
-		if err := sc.Err(); err != nil {
 			return session{}, "", fmt.Errorf("reading %s: %w", path, err)
 		}
 		perFile = append(perFile, records)
@@ -386,6 +370,158 @@ func parseSession(paths []string, id string, extra bool) (session, string, error
 		CreatedAt: createdAt,
 		Messages:  msgs,
 	}, cwd, nil
+}
+
+// readRecords reads all JSONL records from a single file.
+func readRecords(path string) ([]rawRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var records []rawRecord
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 16<<20), 16<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var r rawRecord
+		if json.Unmarshal(line, &r) == nil {
+			records = append(records, r)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// subagentMeta is the metadata from a subagent's .meta.json file.
+type subagentMeta struct {
+	AgentType   string `json:"agentType"`
+	Description string `json:"description"`
+	Name        string `json:"name"`
+}
+
+// parseSubagents reads all subagent JSONL files for a session and returns
+// them as subagent values. The session directory is expected to be
+// <projectDir>/<sessionID>/subagents/.
+func parseSubagents(projectDir, sessionID string, extra bool) ([]subagent, error) {
+	subDir := filepath.Join(projectDir, sessionID, "subagents")
+	entries, err := os.ReadDir(subDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading subagents directory: %w", err)
+	}
+
+	var subs []subagent
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		agentID := strings.TrimSuffix(e.Name(), ".jsonl")
+		agentID = strings.TrimPrefix(agentID, "agent-")
+
+		var meta subagentMeta
+		metaPath := filepath.Join(subDir, strings.TrimSuffix(e.Name(), ".jsonl")+".meta.json")
+		if b, err := os.ReadFile(metaPath); err == nil {
+			if err := json.Unmarshal(b, &meta); err != nil {
+				log.Printf("warning: subagent %s meta: %v", agentID, err)
+			}
+		}
+
+		path := filepath.Join(subDir, e.Name())
+		records, err := readRecords(path)
+		if err != nil {
+			log.Printf("warning: subagent %s: %v", agentID, err)
+			continue
+		}
+
+		// Build the chain. Subagent files are single-file sessions
+		// without compaction, so a simple parentUuid walk suffices.
+		byUUID := make(map[string]*rawRecord, len(records))
+		for i := range records {
+			r := &records[i]
+			if r.UUID != "" {
+				byUUID[r.UUID] = r
+			}
+		}
+
+		// Find the leaf: the last record with a UUID and no child.
+		children := make(map[string]bool, len(records))
+		for _, r := range records {
+			if r.ParentUUID != nil && *r.ParentUUID != "" {
+				children[*r.ParentUUID] = true
+			}
+		}
+		var leafUUID string
+		for i := len(records) - 1; i >= 0; i-- {
+			r := &records[i]
+			if r.UUID != "" && !children[r.UUID] {
+				leafUUID = r.UUID
+				break
+			}
+		}
+		if leafUUID == "" {
+			continue
+		}
+
+		var chain []*rawRecord
+		seen := make(map[string]struct{})
+		for cur := leafUUID; cur != ""; {
+			if _, ok := seen[cur]; ok {
+				break
+			}
+			r, ok := byUUID[cur]
+			if !ok {
+				break
+			}
+			seen[cur] = struct{}{}
+			chain = append(chain, r)
+			if r.ParentUUID == nil {
+				break
+			}
+			cur = *r.ParentUUID
+		}
+		for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+			chain[i], chain[j] = chain[j], chain[i]
+		}
+
+		var createdAt time.Time
+		for _, r := range chain {
+			if r.Type == "user" {
+				t, _ := time.Parse(time.RFC3339Nano, r.Timestamp)
+				if !t.IsZero() {
+					createdAt = t
+					break
+				}
+			}
+		}
+
+		msgs := buildMessages(chain, extra)
+		if len(msgs) == 0 {
+			continue
+		}
+
+		subs = append(subs, subagent{
+			ID:          agentID,
+			Name:        meta.Name,
+			Type:        meta.AgentType,
+			Description: meta.Description,
+			CreatedAt:   createdAt,
+			Messages:    msgs,
+		})
+	}
+
+	sort.Slice(subs, func(i, j int) bool {
+		return subs[i].CreatedAt.Before(subs[j].CreatedAt)
+	})
+
+	return subs, nil
 }
 
 // buildMessages converts a chain of raw records into conversation messages.
